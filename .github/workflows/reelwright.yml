@@ -1,0 +1,57 @@
+name: ReelWright
+
+on:
+  deployment_status:
+
+permissions:
+  contents: read
+  id-token: write # lets the job prove its identity to ReelWright: no upload secret needed
+
+jobs:
+  film:
+    if: >-
+      github.event.deployment_status.state == 'success' &&
+      github.event.deployment.environment == 'production' &&
+      github.event.deployment_status.environment_url != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      RW_API_URL: https://released-tba-premiere-childrens.trycloudflare.com
+      RW_ENGINE_VERSION: 0.1.0
+      RW_ENGINE_SHA256: 583dabffe629e1959222c73cf4f55d19d446985599bd89498afa810ca1a40b20 # upgrades arrive as a pull request that changes these two lines
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.deployment.sha }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install ReelWright (pinned and hash-checked)
+        run: |
+          curl -fsSL "$RW_API_URL/v1/engine/reelwright-$RW_ENGINE_VERSION.tgz" -o "$RUNNER_TEMP/reelwright.tgz"
+          echo "$RW_ENGINE_SHA256  $RUNNER_TEMP/reelwright.tgz" | sha256sum -c -
+          npm install --no-save --no-package-lock "$RUNNER_TEMP/reelwright.tgz"
+          npx --no-install playwright install --with-deps chromium
+
+      - name: Get an upload credential (GitHub OIDC)
+        run: |
+          aud=$(node -e "process.stdout.write(encodeURIComponent(process.env.RW_API_URL))")
+          jwt=$(curl -fsS -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$aud" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>process.stdout.write(JSON.parse(d).value||''))")
+          test -n "$jwt"
+          echo "::add-mask::$jwt"
+          echo "RW_TOKEN=$jwt" >> "$GITHUB_ENV"
+
+      - name: Film the deployed site
+        env:
+          FILM_URL: ${{ github.event.deployment_status.environment_url }}
+          FILM_SHA: ${{ github.event.deployment.sha }}
+        run: npx --no-install reelwright reelwright.config.mjs --url "$FILM_URL" --out reelwright-output --manifest reelwright-output/manifest.json --sha "$FILM_SHA" --upload "$RW_API_URL"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: reelwright-output
+          path: reelwright-output
+          if-no-files-found: warn
